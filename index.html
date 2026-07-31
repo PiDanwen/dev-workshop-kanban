@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://esm.sh" crossorigin />
+<link rel="preconnect" href="https://eldyoqjffvkzpgwbyxhr.supabase.co" crossorigin />
 <title>开发工坊 · 任务看板</title>
 <style>
   :root {
@@ -466,9 +468,14 @@
 
   const DEFAULT_ASSIGNEE = "PiDanwen";
   const ASSIGNEE_COLOR = "#0d9488";
+  const CACHE_KEY = "kanban_tasks_cache_v1";
 
-  // 本地任务缓存（按 id 索引）
+  // 本地任务数据
   let tasks = [];
+  // 本客户端进行中的乐观新建数量（用于识别 Realtime 回声，避免重复上屏）
+  let pendingInserts = 0;
+  // 正在拖拽的卡片元素（拖拽期间暂停 Realtime 渲染，防止节点被移动）
+  let dragEl = null;
 
   // ==================== DOM 引用 ====================
   const board = document.getElementById("board");
@@ -478,6 +485,11 @@
   const syncDot = document.getElementById("sync-dot");
   const toast = document.getElementById("toast");
 
+  // ===== 性能关键：元素缓存，避免全量重建 DOM =====
+  const cardEls = new Map();   // task id -> 卡片元素
+  const colBodies = new Map(); // column id -> 列体元素
+  const colCounts = new Map(); // column id -> 计数元素
+
   let toastTimer;
 
   function showToast(msg, isError) {
@@ -485,6 +497,28 @@
     toast.textContent = msg;
     toast.className = "toast show" + (isError ? " error" : "");
     toastTimer = setTimeout(() => { toast.className = "toast"; }, 2500);
+  }
+
+  // ==================== 本地缓存（二次打开秒开） ====================
+  function loadCache() {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return;
+      const cached = JSON.parse(raw);
+      if (Array.isArray(cached) && cached.length > 0) {
+        tasks = cached;
+        render(); // 先渲染缓存，loadTasks 拿到新数据后自动对齐
+      }
+    } catch (_) {}
+  }
+
+  let cacheTimer;
+  function scheduleSaveCache() {
+    clearTimeout(cacheTimer);
+    cacheTimer = setTimeout(() => {
+      // 排除未落库的临时卡片（负数 id）
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify(tasks.filter(t => t.id > 0))); } catch (_) {}
+    }, 400);
   }
 
   // ==================== Supabase 数据操作 ====================
@@ -501,8 +535,7 @@
         .order("sort_order", { ascending: true });
       if (error) throw error;
       tasks = data || [];
-      render();
-      showToast("数据已加载");
+      render(); // 静默加载，成功不弹 Toast
     } catch (e) {
       console.error("加载失败:", e);
       showToast("加载数据失败: " + e.message, true);
@@ -549,23 +582,28 @@
         .delete()
         .eq("id", id);
       if (error) throw error;
+      return true;
     } catch (e) {
       console.error("删除失败:", e);
       showToast("删除任务失败: " + e.message, true);
+      return false;
     }
   }
 
   async function batchReorder(updates) {
     // updates: [{id, column_id, sort_order}, ...]
+    // 注：Supabase 部分字段 upsert 会触发 NOT NULL 校验（已实测），
+    // 因此用 Promise.all 并行逐条更新，把 N 个串行 RTT 压缩为约 1 个。
+    if (!updates.length) return;
     try {
-      // Supabase 不支持批量 upsert 的部分更新，逐个 update
-      for (const u of updates) {
-        const { error } = await supabase
+      const results = await Promise.all(updates.map(u =>
+        supabase
           .from("tasks")
           .update({ column_id: u.column_id, sort_order: u.sort_order })
-          .eq("id", u.id);
-        if (error) throw error;
-      }
+          .eq("id", u.id)
+      ));
+      const failed = results.find(r => r.error);
+      if (failed) throw failed.error;
     } catch (e) {
       console.error("排序更新失败:", e);
       showToast("排序同步失败: " + e.message, true);
@@ -574,6 +612,19 @@
 
   // ==================== Realtime 订阅 ====================
   let channel;
+  let renderScheduled = false;
+
+  // Realtime 事件可能瞬时成批到达（如拖动引发 N 条 UPDATE），
+  // 用 rAF 合并到下一帧统一渲染，避免重复渲染
+  function scheduleRender() {
+    if (dragEl) return; // 拖拽中不渲染，dragend 时统一处理
+    if (renderScheduled) return;
+    renderScheduled = true;
+    requestAnimationFrame(() => {
+      renderScheduled = false;
+      render();
+    });
+  }
 
   function subscribeRealtime() {
     if (!hasConfig) return;
@@ -587,18 +638,22 @@
           const { eventType, new: row, old } = payload;
           switch (eventType) {
             case "INSERT":
-              if (!tasks.find(t => t.id === row.id)) {
-                tasks.push(row);
-              }
+              // 本客户端乐观新建的回声：跳过，等 saveTask 返回后替换临时卡片
+              if (pendingInserts > 0) { pendingInserts--; break; }
+              if (!tasks.find(t => t.id === row.id)) tasks.push(row);
               break;
             case "UPDATE":
-              tasks = tasks.map(t => (t.id === row.id ? row : t));
+              if (tasks.some(t => t.id === row.id)) {
+                tasks = tasks.map(t => (t.id === row.id ? row : t));
+              } else {
+                tasks.push(row);
+              }
               break;
             case "DELETE":
               tasks = tasks.filter(t => t.id !== old.id);
               break;
           }
-          render();
+          scheduleRender();
           setSyncStatus("online");
         }
       )
@@ -615,7 +670,9 @@
   }
 
   // ==================== 渲染 ====================
-  function render() {
+
+  // 列骨架只构建一次，后续 render 只做增量对齐
+  function buildBoard() {
     board.innerHTML = "";
     COLUMNS.forEach(col => {
       const colEl = document.createElement("section");
@@ -627,7 +684,7 @@
       head.innerHTML =
         '<span class="column-dot" style="background:' + col.color + '"></span>' +
         '<span class="column-title">' + col.name + '</span>' +
-        '<span class="column-count" id="count-' + col.id + '">0</span>';
+        '<span class="column-count">0</span>';
 
       const body = document.createElement("div");
       body.className = "column-body";
@@ -643,10 +700,64 @@
       colEl.appendChild(body);
       board.appendChild(colEl);
 
-      const colTasks = tasks.filter(t => t.column_id === col.id);
-      colTasks.forEach(t => body.appendChild(cardEl(t)));
+      colBodies.set(col.id, body);
+      colCounts.set(col.id, head.querySelector(".column-count"));
     });
+  }
+
+  // 卡片内容指纹：仅这些字段变化才需要重绘卡片内容
+  function taskVersion(t) {
+    return [t.title, t.description, t.priority, t.category, t.due_date].join("");
+  }
+
+  // 增量渲染：新增创建、变化重绘、删除移除、位置对齐；未变化的卡片不动
+  function render() {
+    const seen = new Set();
+
+    for (const col of COLUMNS) {
+      const body = colBodies.get(col.id);
+      if (!body) continue;
+      const colTasks = tasks.filter(t => t.column_id === col.id);
+
+      // 空状态先移除，applyFilter 会按需重新添加
+      const empty = body.querySelector(".empty-state");
+      if (empty) empty.remove();
+
+      let refNode = body.firstChild;
+
+      for (const task of colTasks) {
+        seen.add(task.id);
+        let el = cardEls.get(task.id);
+        const v = taskVersion(task);
+
+        if (!el) {
+          el = cardEl(task);
+          el._v = v;
+          cardEls.set(task.id, el);
+        } else if (el._v !== v) {
+          paintCard(el, task);
+          el._v = v;
+        }
+
+        // 位置对齐：元素已在正确位置时零 DOM 操作
+        if (el !== refNode) {
+          body.insertBefore(el, refNode);
+        } else {
+          refNode = refNode.nextSibling;
+        }
+      }
+    }
+
+    // 移除已删除的卡片
+    for (const [id, el] of cardEls) {
+      if (!seen.has(id)) {
+        el.remove();
+        cardEls.delete(id);
+      }
+    }
+
     applyFilter();
+    scheduleSaveCache();
   }
 
   function cardEl(card) {
@@ -654,11 +765,14 @@
     el.className = "card";
     el.draggable = true;
     el.dataset.id = card.id;
-    el.dataset.assignee = DEFAULT_ASSIGNEE;
-    el.dataset.priority = card.priority;
+    paintCard(el, card);
+    return el;
+  }
 
+  // 只负责填充/刷新卡片内容（事件统一由 board 委托，重绘不丢交互）
+  function paintCard(el, card) {
+    el.dataset.priority = card.priority;
     const di = dueInfo(card.due_date);
-    const personColor = ASSIGNEE_COLOR;
 
     el.innerHTML =
       '<div class="card-top">' +
@@ -668,54 +782,30 @@
       '<h3 class="card-title">' + esc(card.title) + '</h3>' +
       '<p class="card-desc">' + esc(card.description || "") + '</p>' +
       '<div class="card-foot">' +
-        '<span class="avatar" style="background:' + personColor + '">' + DEFAULT_ASSIGNEE.charAt(0) + '</span>' +
+        '<span class="avatar" style="background:' + ASSIGNEE_COLOR + '">' + DEFAULT_ASSIGNEE.charAt(0) + '</span>' +
         '<span class="assignee-name">' + DEFAULT_ASSIGNEE + '</span>' +
         (card.due_date ? '<span class="due ' + di.cls + '">' +
           '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>' +
           di.tip + '</span>' : '') +
         '<div class="card-actions">' +
-          '<button class="card-action-btn edit" data-edit="' + card.id + '" title="编辑任务">' +
+          '<button class="card-action-btn edit" title="编辑任务">' +
             '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>' +
           '</button>' +
-          '<button class="card-action-btn delete" data-delete="' + card.id + '" title="删除任务">' +
+          '<button class="card-action-btn delete" title="删除任务">' +
             '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
           '</button>' +
         '</div>' +
       '</div>';
-
-    el.addEventListener("dragstart", onDragStart);
-    el.addEventListener("dragend", onDragEnd);
-
-    // 删除按钮（新布局：底部 card-action-btn）
-    el.querySelector(".card-action-btn.delete").addEventListener("click", async (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      if (!confirm("确定删除任务「" + card.title + "」？")) return;
-      el.classList.add("saving");
-      await deleteTask(card.id);
-      if (!hasConfig) {
-        tasks = tasks.filter(t => t.id !== card.id);
-        render();
-      }
-    });
-
-    // 编辑按钮（新布局：底部 card-action-btn）
-    el.querySelector(".card-action-btn.edit").addEventListener("click", (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      openModal(card);
-    });
-
-    return el;
   }
 
   function applyFilter() {
     const q = searchInput.value.trim().toLowerCase();
     const fp = priorityFilter.value;
 
-    tasks.forEach(card => {
-      const el = board.querySelector('.card[data-id="' + card.id + '"]');
-      if (!el) return;
+    // 通过元素缓存直接命中，不再逐卡片 querySelector
+    for (const card of tasks) {
+      const el = cardEls.get(card.id);
+      if (!el) continue;
       let show = true;
       if (fp && card.priority !== fp) show = false;
       if (q && !(
@@ -723,12 +813,17 @@
         (card.description || "").toLowerCase().includes(q)
       )) show = false;
       el.classList.toggle("is-hidden", !show);
-    });
+    }
 
-    COLUMNS.forEach(col => {
-      const body = document.getElementById("col-" + col.id);
-      const visible = body.querySelectorAll(".card:not(.is-hidden)").length;
-      document.getElementById("count-" + col.id).textContent = visible;
+    for (const col of COLUMNS) {
+      const body = colBodies.get(col.id);
+      if (!body) continue;
+      let visible = 0;
+      for (const child of body.children) {
+        if (child.classList.contains("card") && !child.classList.contains("is-hidden")) visible++;
+      }
+      const countEl = colCounts.get(col.id);
+      if (countEl) countEl.textContent = visible;
       let empty = body.querySelector(".empty-state");
       if (visible === 0) {
         if (!empty) {
@@ -740,7 +835,7 @@
       } else if (empty) {
         empty.remove();
       }
-    });
+    }
 
     updateStats();
   }
@@ -770,52 +865,65 @@
     return { cls, tip, md };
   }
 
-  // ==================== 拖拽 ====================
-  let dragEl = null;
+  // ==================== 拖拽（事件委托，卡片重绘不影响交互） ====================
 
-  function onDragStart(e) {
-    dragEl = e.currentTarget;
-    dragEl.classList.add("dragging");
+  board.addEventListener("dragstart", (e) => {
+    const card = e.target.closest(".card");
+    if (!card) return;
+    dragEl = card;
+    card.classList.add("dragging");
     e.dataTransfer.effectAllowed = "move";
-    try { e.dataTransfer.setData("text/plain", dragEl.dataset.id); } catch (_) {}
-  }
+    try { e.dataTransfer.setData("text/plain", card.dataset.id); } catch (_) {}
+  });
 
-  async function onDragEnd(e) {
-    if (dragEl) dragEl.classList.remove("dragging");
+  board.addEventListener("dragend", (e) => {
     const el = dragEl;
+    if (el) el.classList.remove("dragging");
     dragEl = null;
     document.querySelectorAll(".column.drag-over").forEach(c => c.classList.remove("drag-over"));
-
     if (!el) return;
 
-    // 同步拖拽结果到数据库
-    const newCol = el.closest(".column-body")?.id.replace("col-", "");
-    const id = parseInt(el.dataset.id, 10);
-    if (!newCol || !id) return;
+    // 拖拽被取消（Esc 或放到无效区域）：仅回弹，不同步
+    let cancelled = false;
+    try { cancelled = !!e.dataTransfer && e.dataTransfer.dropEffect === "none"; } catch (_) {}
+    if (cancelled) { render(); return; }
 
-    // 计算该列新的 sort_order
-    const siblings = [...el.parentNode.querySelectorAll(".card:not(.is-hidden)")];
-    const newOrder = siblings.indexOf(el) + 1;
+    const body = el.closest(".column-body");
+    if (!body) { render(); return; }
+    const newCol = body.id.replace("col-", "");
 
-    const task = tasks.find(t => t.id === id);
-    if (task && (task.column_id !== newCol || task.sort_order !== newOrder)) {
-      await updateTask(id, { column_id: newCol, sort_order: newOrder });
+    // 目标列可见卡片的 DOM 顺序 = 新顺序（拖动过程中 dragover 已就位）
+    const siblings = [...body.querySelectorAll(".card:not(.is-hidden)")];
+    const orderedIds = siblings.map(s => parseInt(s.dataset.id, 10)).filter(n => !isNaN(n));
 
-      // 同时更新该列其他卡片的排序
-      const updates = siblings.map((sib, i) => ({
-        id: parseInt(sib.dataset.id, 10),
-        column_id: newCol,
-        sort_order: i + 1,
-      })).filter(u => u.id !== id);
-      if (updates.length > 0) await batchReorder(updates);
+    // 记录变更前的列与排序，用于计算差异（只同步真正变化的行）
+    const before = new Map(tasks.map(t => [t.id, { col: t.column_id, ord: t.sort_order }]));
 
-      // 乐观更新本地数据
-      task.column_id = newCol;
-      task.sort_order = newOrder;
-      // 等待 Realtime 触发重渲染
-      setTimeout(() => render(), 150);
-    }
-  }
+    // 立即更新本地数据，并把数组顺序调整为视觉顺序，渲染零跳动
+    const idSet = new Set(orderedIds);
+    const moved = [];
+    orderedIds.forEach((tid, i) => {
+      const t = tasks.find(x => x.id === tid);
+      if (t) {
+        t.column_id = newCol;
+        t.sort_order = i + 1;
+        moved.push(t);
+      }
+    });
+    tasks = [...tasks.filter(t => !idSet.has(t.id)), ...moved];
+    render(); // 本地已是最新，UI 即时完成；数据库在后台同步
+
+    // 仅同步发生变化的行（排除未落库的临时卡片），并行发送
+    const updates = moved
+      .filter(t => t.id > 0)
+      .filter(t => {
+        const b = before.get(t.id);
+        return b && (b.col !== t.column_id || b.ord !== t.sort_order);
+      })
+      .map(t => ({ id: t.id, column_id: t.column_id, sort_order: t.sort_order }));
+
+    if (updates.length > 0 && hasConfig) batchReorder(updates);
+  });
 
   function getDragAfter(container, y) {
     const els = [...container.querySelectorAll(".card:not(.dragging):not(.is-hidden)")];
@@ -831,9 +939,40 @@
   function onDragOver(e, body) {
     e.preventDefault();
     if (!dragEl) return;
+    e.dataTransfer.dropEffect = "move";
     const after = getDragAfter(body, e.clientY);
     if (after == null) body.appendChild(dragEl);
     else body.insertBefore(dragEl, after);
+  }
+
+  // ===== 编辑/删除按钮：board 级事件委托 =====
+  board.addEventListener("click", (e) => {
+    const editBtn = e.target.closest(".card-action-btn.edit");
+    const delBtn = e.target.closest(".card-action-btn.delete");
+    if (!editBtn && !delBtn) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const cardNode = e.target.closest(".card");
+    if (!cardNode) return;
+    const id = parseInt(cardNode.dataset.id, 10);
+    const task = tasks.find(t => t.id === id);
+    if (!task) return;
+    if (id < 0) { showToast("任务正在保存中，请稍候", true); return; }
+    if (editBtn) openModal(task);
+    else handleDelete(task);
+  });
+
+  async function handleDelete(task) {
+    if (!confirm("确定删除任务「" + task.title + "」？")) return;
+    // 乐观删除：先移除上屏，失败再回滚
+    const backupArr = tasks;
+    tasks = tasks.filter(t => t.id !== task.id);
+    render();
+    const ok = await deleteTask(task.id);
+    if (!ok) {
+      tasks = backupArr;
+      render();
+    }
   }
 
   // ==================== Modal（新建/编辑） ====================
@@ -879,19 +1018,56 @@
     closeModal();
 
     if (id) {
-      // 编辑
-      const result = await updateTask(parseInt(id, 10), data);
+      // ===== 编辑：乐观更新，先上屏后落库，失败回滚 =====
+      const numId = parseInt(id, 10);
+      if (numId < 0) { showToast("任务正在保存中，请稍候", true); return; }
+      const idx = tasks.findIndex(t => t.id === numId);
+      if (idx === -1) return;
+      const backup = { ...tasks[idx] };
+      tasks[idx] = { ...tasks[idx], ...data };
+      render();
+      const result = await updateTask(numId, data);
       if (result) {
         tasks = tasks.map(t => t.id === result.id ? result : t);
         render();
+      } else {
+        tasks = tasks.map(t => t.id === numId ? backup : t);
+        render();
       }
     } else {
-      // 新建
+      // ===== 新建：乐观更新，临时卡片先上屏，拿到真实 id 后无缝替换 =====
       data.column_id = "backlog";
       data.sort_order = tasks.filter(t => t.column_id === "backlog").length + 1;
+
+      const tempId = -Date.now(); // 负数临时 id，不与真实主键冲突
+      tasks.push({ ...data, id: tempId });
+      pendingInserts++;
+      render();
+
       const result = await saveTask(data);
       if (result) {
-        tasks.push(result);
+        const tempIdx = tasks.findIndex(t => t.id === tempId);
+        const realIdx = tasks.findIndex(t => t.id === result.id);
+        if (realIdx !== -1) {
+          // Realtime 已先一步插入真实行：仅移除临时行
+          if (tempIdx !== -1) tasks.splice(tempIdx, 1);
+        } else if (tempIdx !== -1) {
+          tasks[tempIdx] = result;
+        } else {
+          tasks.push(result);
+        }
+        // 迁移元素映射：复用已有卡片节点，避免重建闪烁
+        const el = cardEls.get(tempId);
+        if (el) {
+          cardEls.delete(tempId);
+          el.dataset.id = String(result.id);
+          cardEls.set(result.id, el);
+        }
+        render();
+      } else {
+        // 失败回滚：移除临时卡片
+        tasks = tasks.filter(t => t.id !== tempId);
+        pendingInserts = Math.max(0, pendingInserts - 1);
         render();
       }
     }
@@ -922,7 +1098,12 @@
     ).join("");
   }
 
-  searchInput.addEventListener("input", applyFilter);
+  // 搜索防抖 150ms，避免每个按键都全量过滤
+  let searchTimer;
+  searchInput.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(applyFilter, 150);
+  });
   priorityFilter.addEventListener("change", applyFilter);
 
   // ==================== 重置种子数据 ====================
@@ -965,6 +1146,8 @@
 
   // ==================== 启动 ====================
   buildFilters();
+  buildBoard();
+  loadCache(); // 二次打开先用缓存秒开，再与服务器对齐
 
   if (hasConfig) {
     setSyncStatus("syncing");
