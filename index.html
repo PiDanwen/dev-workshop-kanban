@@ -247,17 +247,26 @@
   .cat-缺陷 { background: #ef4444; }
   .cat-需求 { background: #f59e0b; }
 
-  .card-delete {
-    position: absolute; top: 8px; right: 8px;
-    width: 22px; height: 22px; border: none; background: none;
-    color: #9aa1ad; cursor: pointer; border-radius: 6px;
-    display: none; align-items: center; justify-content: center;
-    font-size: 16px; line-height: 1; padding: 0;
+  .card-actions {
+    display: flex; gap: 6px;
+    margin-left: auto;
+    opacity: 0.4;
+    transition: opacity .15s;
   }
-  .card:hover .card-delete { display: flex; }
-  .card-delete:hover { background: #fef2f2; color: #dc2626; }
+  .card:hover .card-actions { opacity: 1; }
+  .card-action-btn {
+    width: 28px; height: 28px; border: 1px solid var(--border);
+    background: var(--surface); border-radius: 7px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; color: var(--muted);
+    transition: all .15s;
+    font-size: 13px; line-height: 1; padding: 0;
+  }
+  .card-action-btn:hover { background: var(--surface-2); color: var(--text); border-color: #c0c5cc; }
+  .card-action-btn.edit:hover { background: #eff6ff; color: #2563eb; border-color: #93c5fd; }
+  .card-action-btn.delete:hover { background: #fef2f2; color: #dc2626; border-color: #fecaca; }
 
-  .card-title { margin: 0 0 5px; font-size: 14px; font-weight: 700; line-height: 1.4; padding-right: 20px; }
+  .card-title { margin: 0 0 5px; font-size: 14px; font-weight: 700; line-height: 1.4; }
   .card-desc {
     margin: 0 0 11px; font-size: 12.5px; color: var(--muted);
     line-height: 1.55;
@@ -411,16 +420,6 @@
         </div>
       </div>
       <div class="form-row">
-        <div class="form-group">
-          <label for="form-category">分类</label>
-          <select id="form-category">
-            <option value="前端">前端</option>
-            <option value="后端">后端</option>
-            <option value="设计">设计</option>
-            <option value="缺陷">缺陷</option>
-            <option value="需求">需求</option>
-          </select>
-        </div>
         <div class="form-group">
           <label for="form-due">截止日期</label>
           <input id="form-due" type="date" />
@@ -663,40 +662,43 @@
 
     el.innerHTML =
       '<div class="card-top">' +
-        '<span class="priority ' + (card.priority || "P2").toLowerCase() + '">' + esc(card.priority || "P2") + '</span>' +
-        '<span class="category cat-' + esc(card.category) + '">' + esc(card.category) + '</span>' +
-      '</div>' +
-      '<button class="card-delete" data-id="' + card.id + '" title="删除任务">&times;</button>' +
-      '<h3 class="card-title">' + esc(card.title) + '</h3>' +
-      '<p class="card-desc">' + esc(card.description || "") + '</p>' +
-      '<div class="card-foot">' +
         '<span class="avatar" style="background:' + personColor + '">' + DEFAULT_ASSIGNEE.charAt(0) + '</span>' +
         '<span class="assignee-name">' + DEFAULT_ASSIGNEE + '</span>' +
         (card.due_date ? '<span class="due ' + di.cls + '">' +
           '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>' +
           di.tip + '</span>' : '') +
+        '<div class="card-actions">' +
+          '<button class="card-action-btn edit" data-edit="' + card.id + '" title="编辑任务">' +
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>' +
+          '</button>' +
+          '<button class="card-action-btn delete" data-delete="' + card.id + '" title="删除任务">' +
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
+          '</button>' +
+        '</div>' +
       '</div>';
 
     el.addEventListener("dragstart", onDragStart);
     el.addEventListener("dragend", onDragEnd);
 
-    // 删除按钮
-    el.querySelector(".card-delete").addEventListener("click", async (e) => {
+    // 删除按钮（新布局：底部 card-action-btn）
+    el.querySelector(".card-action-btn.delete").addEventListener("click", async (e) => {
       e.stopPropagation();
       e.preventDefault();
       if (!confirm("确定删除任务「" + card.title + "」？")) return;
       el.classList.add("saving");
       await deleteTask(card.id);
-      // 由 Realtime DELETE 事件触发重新渲染
-      // 如果没有 Realtime，手动处理
       if (!hasConfig) {
         tasks = tasks.filter(t => t.id !== card.id);
         render();
       }
     });
 
-    // 双击编辑
-    el.addEventListener("dblclick", () => openModal(card));
+    // 编辑按钮（新布局：底部 card-action-btn）
+    el.querySelector(".card-action-btn.edit").addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      openModal(card);
+    });
 
     return el;
   }
