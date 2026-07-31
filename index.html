@@ -662,6 +662,12 @@
 
     el.innerHTML =
       '<div class="card-top">' +
+        '<span class="priority ' + (card.priority || "P2").toLowerCase() + '">' + esc(card.priority || "P2") + '</span>' +
+        '<span class="category cat-' + esc(card.category) + '">' + esc(card.category) + '</span>' +
+      '</div>' +
+      '<h3 class="card-title">' + esc(card.title) + '</h3>' +
+      '<p class="card-desc">' + esc(card.description || "") + '</p>' +
+      '<div class="card-foot">' +
         '<span class="avatar" style="background:' + personColor + '">' + DEFAULT_ASSIGNEE.charAt(0) + '</span>' +
         '<span class="assignee-name">' + DEFAULT_ASSIGNEE + '</span>' +
         (card.due_date ? '<span class="due ' + di.cls + '">' +
